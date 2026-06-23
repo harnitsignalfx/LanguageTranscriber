@@ -1,0 +1,6 @@
+{
+    "apiKey": "sk-REPLACE_WITH_YOUR_OPENAI_API_KEY",
+    "model": "gpt-realtime-translate",
+    "otherLanguage": null,
+    "segmentSilenceMs": 1500
+}
