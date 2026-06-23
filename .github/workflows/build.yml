@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build LanguageTranscriber.app
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Cache SwiftPM build artifacts
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-swiftpm-
+
+      - name: Build .app
+        run: ./build.sh release
+
+      - name: Sanity-check the build
+        run: |
+          set -e
+          BIN="build/LanguageTranscriber.app/Contents/MacOS/LanguageTranscriber"
+          test -x "$BIN" || { echo "Missing or non-executable binary at $BIN"; exit 1; }
+          codesign -dv "build/LanguageTranscriber.app" 2>&1
+          file "$BIN"
+          ls -la "build/LanguageTranscriber.app/Contents/"
+          ls -la "build/LanguageTranscriber.app/Contents/Resources/"
+
+      - name: Zip the .app (ditto preserves Mach-O signatures and bundle metadata)
+        run: |
+          mkdir -p artifact
+          ditto -c -k --keepParent build/LanguageTranscriber.app artifact/LanguageTranscriber.zip
+          ls -lh artifact/
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanguageTranscriber-app
+          path: artifact/LanguageTranscriber.zip
+          retention-days: 14
+          if-no-files-found: error
