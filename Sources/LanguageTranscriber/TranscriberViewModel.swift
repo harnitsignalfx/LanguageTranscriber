@@ -87,7 +87,7 @@ final class TranscriberViewModel: ObservableObject {
         loadConfig()
         refreshPermissions()
         permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshPermissions() }
+            Task { @MainActor [weak self] in self?.refreshPermissions() }
         }
     }
 
@@ -214,17 +214,17 @@ final class TranscriberViewModel: ObservableObject {
                                targetLanguage: target)
         let isEnglish = (target == "en")
         c.onState = { [weak self] state in
-            Task { @MainActor in self?.handleClientState(state) }
+            Task { @MainActor [weak self] in self?.handleClientState(state) }
         }
         c.onTargetDelta = { [weak self] delta in
-            Task { @MainActor in self?.handleTargetDelta(delta, isEnglish: isEnglish) }
+            Task { @MainActor [weak self] in self?.handleTargetDelta(delta, isEnglish: isEnglish) }
         }
         c.onError = { [weak self] err in
-            Task { @MainActor in self?.setStatus(err, isError: true) }
+            Task { @MainActor [weak self] in self?.setStatus(err, isError: true) }
         }
         if isEnglish {
             c.onAnyEvent = { [weak self] type in
-                Task { @MainActor in self?.eventCounts[type, default: 0] += 1 }
+                Task { @MainActor [weak self] in self?.eventCounts[type, default: 0] += 1 }
             }
         }
         return c
@@ -257,7 +257,7 @@ final class TranscriberViewModel: ObservableObject {
             }
         }
         m.onError = { [weak self] err in
-            Task { @MainActor in self?.setStatus(err, isError: true) }
+            Task { @MainActor [weak self] in self?.setStatus(err, isError: true) }
         }
         m.start()
         self.mic = m
@@ -275,7 +275,7 @@ final class TranscriberViewModel: ObservableObject {
             }
         }
         s.onError = { [weak self] err in
-            Task { @MainActor in self?.setStatus(err, isError: true) }
+            Task { @MainActor [weak self] in self?.setStatus(err, isError: true) }
         }
         self.sysAudio = s
         Task { await s.start() }
@@ -284,7 +284,8 @@ final class TranscriberViewModel: ObservableObject {
     private func fanOutAudio(_ data: Data) {
         englishClient?.sendAudio(data)
         otherClient?.sendAudio(data)
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             self.audioBytesSent &+= Int64(data.count)
             self.lastAudioAt = Date()
         }
@@ -307,7 +308,7 @@ final class TranscriberViewModel: ObservableObject {
         flushWork?.cancel()
         let ms = config?.resolvedSegmentSilenceMs ?? 1500
         let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor in self?.flushLive() }
+            Task { @MainActor [weak self] in self?.flushLive() }
         }
         flushWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms), execute: work)
