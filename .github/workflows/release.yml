@@ -1,0 +1,70 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag v1.0.0 && git push origin v1.0.0
+# This builds the .app, packages it into a zip + dmg, and publishes a GitHub
+# Release with those files attached.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # required to create the release and upload assets
+
+jobs:
+  release:
+    name: Build & publish release
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build .app
+        run: ./build.sh release
+
+      - name: Package zip + dmg
+        run: ./package.sh --dmg
+
+      - name: Sanity-check artifacts
+        run: |
+          set -e
+          ls -lh dist/
+          test -n "$(ls dist/*.zip 2>/dev/null)" || { echo "No zip produced"; exit 1; }
+          test -n "$(ls dist/*.dmg 2>/dev/null)" || { echo "No dmg produced"; exit 1; }
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          # Build release notes. Keep it short; the install steps matter most because
+          # the build is ad-hoc signed (Gatekeeper will warn on first launch).
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<'EOF'
+          Native macOS bilingual transcription / translation app.
+
+          ## Install
+          1. Download the `.dmg` below and open it.
+          2. Drag **LanguageTranscriber.app** into Applications.
+          3. First launch: this build is **ad-hoc signed** (no Apple Developer ID), so macOS
+             will block it. Right-click the app → **Open** → **Open Anyway**, or run:
+             `xattr -cr /Applications/LanguageTranscriber.app`
+          4. Open **Settings (⌘,)** and paste your OpenAI API key (stored in your Keychain).
+
+          Requires macOS 13 (Ventura) or later. See the README for full usage.
+          EOF
+
+          gh release create "$TAG" \
+            dist/*.zip dist/*.dmg \
+            --title "$TAG" \
+            --notes-file "$NOTES_FILE" \
+            --verify-tag
