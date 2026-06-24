@@ -149,6 +149,11 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func handleMessage(_ text: String) {
+        // Fast-path: the translation endpoint streams translated TTS audio we never use.
+        // Skip the expensive JSON parse + base64 decode for those frames. `type` is always
+        // at the start of the event, so a short prefix check avoids scanning the huge blob.
+        if text.prefix(120).contains("\"session.output_audio.delta\"") { return }
+
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String else { return }
