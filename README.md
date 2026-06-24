@@ -127,6 +127,38 @@ For peers, run:
 
 That produces `dist/LanguageTranscriber-<version>-<date>.zip` and `.dmg`. Since the build is only **ad-hoc signed**, recipients will see Gatekeeper warnings. They can either right-click → Open → "Open Anyway", or strip the quarantine bit with `xattr -cr /Applications/LanguageTranscriber.app`. For a smoother distribution path you'd sign + notarize with a paid Apple Developer ID — PRs welcome on that front (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## Releases
+
+Tagged releases are built and published automatically by GitHub Actions. To cut one:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+Pushing any `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which on a `macos-14` runner:
+
+1. Builds the `.app` (`./build.sh release`)
+2. Packages it (`./package.sh --dmg`) into a `.zip` and a `.dmg`
+3. Publishes a GitHub Release for the tag with both files attached and install notes (including the Gatekeeper workaround)
+
+The result appears under [Releases](../../releases) with permanent public download links — unlike the per-PR build artifacts, which are collaborator-only and expire after 14 days.
+
+**Versioning:** the version embedded in the asset filenames comes from `CFBundleShortVersionString` in `Resources/Info.plist`. Bump that value before tagging if you want the filenames to track the new version (the git tag drives the Release title; the plist drives the filenames).
+
+**Re-cutting a tag** (e.g. after a fix): move the tag to the new commit and re-push —
+
+```bash
+git tag -d v1.1.0
+git push origin :refs/tags/v1.1.0   # delete the remote tag
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+### Continuous integration
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the `.app` on every push to `main` and every PR, sanity-checks the signed binary, and uploads it as a run artifact — so reviewers can grab a working build without compiling locally.
+
 ## Contributing
 
 PRs and issues welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).

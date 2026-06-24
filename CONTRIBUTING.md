@@ -58,6 +58,17 @@ Include in the issue:
 - Whether the `Events:` row in the footer is incrementing during the bug
 - Logs from `Console.app` filtered to `LanguageTranscriber`
 
+## Cutting a release
+
+Releases are automated. Push a version tag and GitHub Actions builds + publishes it:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+This runs [`.github/workflows/release.yml`](.github/workflows/release.yml): build → `package.sh --dmg` → GitHub Release with the `.zip` and `.dmg` attached. Bump `CFBundleShortVersionString` in `Resources/Info.plist` first if you want the asset filenames to reflect the new version. See the [Releases section of the README](README.md#releases) for the full flow, including how to re-cut a tag after a fix.
+
 ## License
 
 By contributing you agree that your contribution is licensed under the same [MIT License](LICENSE) as the rest of the project.
