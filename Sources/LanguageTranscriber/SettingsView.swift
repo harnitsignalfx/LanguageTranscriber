@@ -76,6 +76,10 @@ struct SettingsView: View {
 
             Divider().padding(.vertical, 6)
 
+            transcriptionAndTimingSection
+
+            Divider().padding(.vertical, 6)
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("How it's stored")
                     .font(.subheadline.bold())
@@ -88,6 +92,98 @@ struct SettingsView: View {
         .padding(20)
         .frame(width: 480)
         .onAppear { apiKey = KeychainStore.loadAPIKey() ?? "" }
+    }
+
+    // MARK: - Transcription & Timing
+
+    private var transcriptionAndTimingSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Transcription & Timing")
+                .font(.headline)
+
+            // Segment silence — quiet window before a paragraph is committed.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Segment silence")
+                        .font(.subheadline)
+                    Spacer()
+                    Text("\(vm.segmentSilenceMs) ms")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Slider(
+                    value: Binding(
+                        get: { Double(vm.segmentSilenceMs) },
+                        set: { vm.segmentSilenceMs = Int($0.rounded()) }
+                    ),
+                    in: 300...3000,
+                    step: 100
+                )
+                Text("Quiet window before a paragraph is committed to history.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Sentence-break window — shorter quiet window once a sentence ends.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Sentence-break window")
+                        .font(.subheadline)
+                    Spacer()
+                    Text("\(vm.sentenceFlushMs) ms")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Slider(
+                    value: Binding(
+                        get: { Double(vm.sentenceFlushMs) },
+                        set: { vm.sentenceFlushMs = Int($0.rounded()) }
+                    ),
+                    in: 200...2000,
+                    step: 50
+                )
+                Text("Shorter quiet window used once the buffer ends a sentence. Both timing values apply live.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().padding(.vertical, 2)
+
+            // Detect source language — drives the green "originally spoken" highlight.
+            Toggle(isOn: $vm.detectSourceLanguage) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Detect source language")
+                        .font(.subheadline)
+                    Text("Runs a third transcription session to highlight which side was originally spoken.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .disabled(vm.isRunning)
+
+            // Transcription model — only relevant when detection is on.
+            HStack {
+                Text("Transcription model")
+                    .font(.subheadline)
+                Spacer()
+                Picker("", selection: $vm.transcriptionModel) {
+                    ForEach(TranscriberViewModel.transcriptionModelOptions, id: \.value) { option in
+                        Text(option.label).tag(option.value)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 220)
+                .disabled(vm.isRunning || !vm.detectSourceLanguage)
+            }
+
+            Text("Applies on next Start.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func save() {

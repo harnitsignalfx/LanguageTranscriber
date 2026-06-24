@@ -11,7 +11,12 @@ struct ContentView: View {
                 ConfigBanner(message: vm.configIssue ?? "")
             }
             transcriptArea
-            statusBar
+            // Isolated subview observing the DiagnosticsStore (a plain `let` on the VM, read
+            // here WITHOUT subscribing ContentView to it). A 4 Hz diagnostics tick fires
+            // objectWillChange on `diagnostics` only → re-renders ONLY this bar, never
+            // ContentView.body. The low-churn status/permission values are read from the VM
+            // via @EnvironmentObject inside StatusBarView.
+            StatusBarView(diagnostics: vm.diagnostics)
         }
         .background(Color(NSColor.windowBackgroundColor))
     }
@@ -69,16 +74,17 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .controlSize(.large)
             .help("Clear transcript")
-            .disabled(vm.pairs.isEmpty && !hasAnyLive)
+            // Enabled whenever a session is running OR there are committed pairs — both are
+            // low-churn (isRunning flips only on start/stop; hasPairs only empty<->non-empty).
+            // We intentionally do NOT read live text here: it toggles every utterance and would
+            // re-run ContentView.body a few times/sec, rebuilding the toolbar's Pickers. While
+            // running, Clear stays enabled so the user can wipe in-flight live text too.
+            .disabled(!vm.isRunning && !vm.hasPairs)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-        .background(.regularMaterial)
+        .background(Color(NSColor.windowBackgroundColor))
         .overlay(Divider(), alignment: .bottom)
-    }
-
-    private var hasAnyLive: Bool {
-        !vm.liveEnglish.isEmpty || !vm.liveOther.isEmpty
     }
 
     // MARK: - Transcript area
@@ -104,15 +110,25 @@ struct ContentView: View {
             Divider()
 
             // History fills all the space between the headers and the live pane.
-            // No auto-scroll: scroll position is stable while you read.
-            historyScroll
+            // HistoryContainerView observes the TranscriptStore (a plain `let` on the VM, read
+            // here WITHOUT subscribing ContentView to it) — so a pair flush fires
+            // objectWillChange on `transcript` only, re-rendering the container + the
+            // (equatable) list, NOT ContentView.body. If ContentView.body read the pairs here,
+            // every flush would rebuild the toolbar's Pickers (the expensive 20-item language
+            // menu). The container + separate store severs that.
+            HistoryContainerView(transcript: vm.transcript, otherLanguage: vm.selectedOtherLanguage)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
 
             // Live pane (fixed) + breathing room before the status bar. The padding lives
-            // on the live pane itself so the surrounding view doesn't grow.
-            livePane
+            // on the live pane itself so the surrounding view doesn't grow. Isolated in its
+            // own View struct (LivePaneView) that observes the LiveTextStore (a plain `let` on
+            // the VM, read here WITHOUT subscribing ContentView to it) — a translation delta
+            // fires objectWillChange on `liveText` only, re-rendering ONLY the live pane, not
+            // ContentView.body. `isRunning` is passed as a plain `let` (low-churn) so the pane
+            // observes ONLY liveText, not the VM.
+            LivePaneView(liveText: vm.liveText, isRunning: vm.isRunning)
                 .padding(.top, 8)
                 .padding(.bottom, 12)
         }
@@ -152,27 +168,264 @@ struct ContentView: View {
                     .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.08)))
                 })
                 .buttonStyle(.plain)
-                .disabled(vm.pairs.isEmpty)
+                .disabled(!vm.hasPairs)
             }
         }
         .padding(.horizontal, 16).padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial)
+        .background(Color(NSColor.windowBackgroundColor))
     }
 
-    // History scroll view — intentionally has NO auto-scroll. The user can read past
-    // content without being pulled to the bottom every time a new pair lands. The live
-    // pane below shows the current utterance, so the user never loses sight of what's
-    // currently being said.
-    private var historyScroll: some View {
-        ScrollView {
-            if vm.pairs.isEmpty {
-                emptyState.padding(.top, 80).frame(maxWidth: .infinity)
+    // MARK: - Helpers
+
+    private func copyAllEnglish() {
+        let text = vm.transcript.pairs.map(\.english).joined(separator: "\n\n")
+        copyToClipboard(text)
+    }
+
+    private func copyAllOther() {
+        let text = vm.transcript.pairs.map(\.other).joined(separator: "\n\n")
+        copyToClipboard(text)
+    }
+
+    private func copyToClipboard(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(trimmed, forType: .string)
+    }
+}
+
+// MARK: - Live pane (isolated subview)
+
+/// The current-utterance pane, extracted into its own `View` that observes ONLY the
+/// high-churn `LiveTextStore` (passed as `LivePaneView(liveText: vm.liveText)`). A translation
+/// delta fires objectWillChange on `liveText` only, so it re-renders ONLY this small pane —
+/// the toolbar, column headers, history list, and status bar are untouched. `isRunning` is a
+/// plain `let` (low-churn) so this pane does NOT observe the VM at all.
+private struct LivePaneView: View {
+    @ObservedObject var liveText: LiveTextStore
+    let isRunning: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            liveCell(text: liveText.other, accent: .indigo)
+            Divider()
+            liveCell(text: liveText.english, accent: .blue)
+        }
+        .frame(height: 90)
+        .background(Color(NSColor.controlBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+    }
+
+    // No ScrollView here — a fixed-height caption box with the text bottom-aligned and
+    // clipped keeps the latest words visible (like live captions) without paying for
+    // ScrollView/ScrollViewReader layout + a scrollTo animation on every delta. That
+    // ScrollView relayout-per-delta was the dominant remaining CPU cost during speech.
+    private func liveCell(text: String, accent: Color) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(accent.opacity(text.isEmpty ? 0.15 : 0.55))
+                .frame(width: 3)
+            cellContent(text: text, accent: accent)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+    }
+
+    @ViewBuilder
+    private func cellContent(text: String, accent: Color) -> some View {
+        if text.isEmpty {
+            if isRunning {
+                HStack(spacing: 6) {
+                    Circle().fill(accent.opacity(0.6)).frame(width: 6, height: 6)
+                    Text("Listening…").font(.system(size: 13)).italic().foregroundStyle(.tertiary)
+                }
             } else {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(vm.pairs) { pair in
-                        pairRow(pair).id(pair.id)
-                        Divider().opacity(0.4)
+                Text("Idle").font(.system(size: 13)).foregroundStyle(.tertiary)
+            }
+        } else {
+            Text(text)
+                .font(.system(size: 16))
+                .lineSpacing(4)
+                .italic()
+                .foregroundStyle(.primary.opacity(0.9))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - Status bar (isolated subview)
+
+/// The bottom diagnostics/status bar. Observes the high-churn `DiagnosticsStore`
+/// (`@ObservedObject var diagnostics`, passed as `StatusBarView(diagnostics: vm.diagnostics)`)
+/// so the 4 Hz diagnostics tick fires objectWillChange on `diagnostics` only → re-renders
+/// ONLY this bar, never ContentView.body. The low-churn status/permission values are read from
+/// the VM via @EnvironmentObject (they change only on discrete control events, never at the
+/// 4 Hz/delta rate, so observing the VM here does not reintroduce steady-state churn).
+private struct StatusBarView: View {
+    @ObservedObject var diagnostics: DiagnosticsStore
+    @EnvironmentObject var vm: TranscriberViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 10) {
+                StatusBadge(text: vm.statusText, isRunning: vm.isRunning, isError: vm.statusIsError)
+                Spacer()
+                APIKeyChip(source: vm.apiKeySource, action: openSettingsWindow)
+                PermissionChip(label: "Mic", state: vm.micPermission, relevant: vm.selectedSource.usesMic)
+                PermissionChip(label: "Screen", state: vm.screenPermission, relevant: vm.selectedSource.usesScreen)
+                Divider().frame(height: 14)
+                DataChip(icon: "arrow.up.circle.fill",
+                         text: formatBytes(diagnostics.audioBytesSent),
+                         tint: (vm.isRunning && diagnostics.audioBytesSent == 0) ? .red : .secondary)
+                Text(lastFrameText).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                Divider().frame(height: 14)
+                Text("EN \(diagnostics.englishDeltasReceived) · \(vm.selectedOtherLanguage.uppercased()) \(diagnostics.otherDeltasReceived)")
+                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                Divider().frame(height: 14)
+                TranscriptionChip(status: diagnostics.transcriptionStatus,
+                                  chars: diagnostics.transcriptionCharsReceived)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+    }
+
+    private var lastFrameText: String {
+        guard let last = diagnostics.lastAudioAt else { return "no audio" }
+        let dt = Date().timeIntervalSince(last)
+        if dt < 1.0 { return "live" }
+        return String(format: "%.1fs", dt)
+    }
+
+    private func formatBytes(_ n: Int64) -> String {
+        let kb = Double(n) / 1024
+        if kb < 1 { return "\(n) B" }
+        let mb = kb / 1024
+        if mb < 1 { return String(format: "%.1f KB", kb) }
+        return String(format: "%.2f MB", mb)
+    }
+}
+
+// MARK: - Scroll position tracking
+
+/// Reports the bottom sentinel's maxY (in the scroll viewport's coordinate space) so the
+/// history view can decide whether it's parked at the bottom.
+private struct HistoryBottomKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+// MARK: - History list (isolated subview)
+
+/// The finalized-utterance history list, extracted into its own `View` so it is diff-stable:
+/// it observes NOTHING from the view model — its only inputs are the `pairs` array and the
+/// `otherLanguage` code, passed as plain `let`s. When `ContentView.body` re-runs because of a
+/// live-text or diagnostic change, SwiftUI compares this view's stored inputs, finds them
+/// unchanged, and skips re-rendering the whole list — so scrolling is never interrupted by
+/// live deltas. `UtterancePair` is `Equatable`, so the `Equatable` conformance gives SwiftUI a
+/// cheap structural comparison (used via `.equatable()` at the call site / automatically).
+///
+/// Intentionally has NO auto-scroll except stick-to-bottom: the user can read past content
+/// without being yanked down on every new pair. The live pane below shows the current
+/// utterance, so the user never loses sight of what's currently being said.
+/// Thin wrapper that observes ONLY the `TranscriptStore` (`@ObservedObject var transcript`,
+/// passed as `HistoryContainerView(transcript: vm.transcript, ...)`) and feeds its `pairs`
+/// into the equatable `HistoryListView`. This keeps the pairs dependency OUT of
+/// `ContentView.body`: a pair flush fires objectWillChange on `transcript` only, re-rendering
+/// just this container (which then lets the `.equatable()` list decide whether to redraw),
+/// instead of re-running ContentView.body and rebuilding the toolbar's Pickers.
+/// `otherLanguage` is a plain `let` (low-churn) passed down from ContentView.
+private struct HistoryContainerView: View {
+    @ObservedObject var transcript: TranscriptStore
+    let otherLanguage: String
+    var body: some View {
+        HistoryListView(pairs: transcript.pairs, otherLanguage: otherLanguage)
+            .equatable()
+    }
+}
+
+private struct HistoryListView: View, Equatable {
+    let pairs: [UtterancePair]
+    let otherLanguage: String
+
+    /// Whether the history scroll is parked at (or near) the bottom. Drives stick-to-bottom:
+    /// new content auto-scrolls only while the user is already at the bottom. Local @State so
+    /// scroll-position churn never touches the view model or ContentView.
+    @State private var historyAtBottom = true
+
+    private static let historyCoordSpace = "historyScroll"
+    private static let historyBottomID = "history-bottom-anchor"
+
+    // Equality is driven entirely by the inputs SwiftUI passes in. @State is excluded from
+    // the synthesized/explicit comparison (it is owned by SwiftUI, not an input), so the list
+    // re-renders only when pairs or the language actually change.
+    //
+    // `pairs` is append-only and each pair is immutable once committed (its id is a fixed
+    // UUID), so count + last id uniquely identifies the list contents. This is O(1) instead
+    // of the O(n) elementwise Array compare, which runs on every ContentView.body eval
+    // (per delta + 4 Hz) and would otherwise grow with transcript length.
+    static func == (lhs: HistoryListView, rhs: HistoryListView) -> Bool {
+        lhs.otherLanguage == rhs.otherLanguage
+            && lhs.pairs.count == rhs.pairs.count
+            && lhs.pairs.last?.id == rhs.pairs.last?.id
+    }
+
+    var body: some View {
+        GeometryReader { outer in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    if pairs.isEmpty {
+                        emptyState.padding(.top, 80).frame(maxWidth: .infinity)
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(pairs) { pair in
+                                pairRow(pair).id(pair.id)
+                                Divider().opacity(0.4)
+                            }
+                            // Sentinel kept ONLY as a scrollTo target id. Its measurement
+                            // used to drive "at bottom" detection, but that broke: when the
+                            // user scrolls up the LazyVStack virtualizes the sentinel away,
+                            // its GeometryReader stops publishing, and historyAtBottom froze
+                            // at true. Detection now lives on the container background below.
+                            Color.clear
+                                .frame(height: 1)
+                                .id(Self.historyBottomID)
+                        }
+                        // Measure the WHOLE content container, which is always laid out:
+                        // a LazyVStack reports its full frame (full content height + current
+                        // scroll offset) even while its child VIEWS are virtualized. In the
+                        // viewport-anchored coordinate space its maxY shifts continuously as
+                        // the user drags, so detection updates during the scroll.
+                        .background(GeometryReader { g in
+                            Color.clear.preference(
+                                key: HistoryBottomKey.self,
+                                value: g.frame(in: .named(Self.historyCoordSpace)).maxY)
+                        })
+                    }
+                }
+                .coordinateSpace(name: Self.historyCoordSpace)
+                .onPreferenceChange(HistoryBottomKey.self) { contentMaxY in
+                    // Content's bottom edge measured from the viewport top. At the bottom it
+                    // sits at ≈ viewport height; scrolled up it exceeds viewport height. A
+                    // small slack absorbs sub-pixel rounding and the animated settle.
+                    historyAtBottom = contentMaxY <= outer.size.height + 24
+                }
+                .onChange(of: pairs.count) { _ in
+                    guard historyAtBottom else { return }
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(Self.historyBottomID, anchor: .bottom)
                     }
                 }
             }
@@ -191,7 +444,7 @@ struct ContentView: View {
         }
         .contextMenu {
             Button("Copy English") { copyToClipboard(pair.english) }
-            Button("Copy \(Languages.find(vm.selectedOtherLanguage).displayName)") { copyToClipboard(pair.other) }
+            Button("Copy \(Languages.find(otherLanguage).displayName)") { copyToClipboard(pair.other) }
             Button("Copy Both") { copyToClipboard("\(pair.other)\n\n\(pair.english)") }
         }
     }
@@ -215,71 +468,6 @@ struct ContentView: View {
         Color.green.opacity(0.14)
     }
 
-    // MARK: - Live pane (the current utterance, separated from history)
-
-    private var livePane: some View {
-        HStack(spacing: 0) {
-            liveCell(text: vm.liveOther, accent: .indigo)
-            Divider()
-            liveCell(text: vm.liveEnglish, accent: .blue)
-        }
-        .frame(height: 90)
-        .background(Color(NSColor.controlBackgroundColor))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal, 12)
-    }
-
-    private func liveCell(text: String, accent: Color) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                HStack(alignment: .top, spacing: 8) {
-                    RoundedRectangle(cornerRadius: 1.5)
-                        .fill(accent.opacity(text.isEmpty ? 0.15 : 0.55))
-                        .frame(width: 3)
-                    Group {
-                        if text.isEmpty {
-                            if vm.isRunning {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(accent.opacity(0.6))
-                                        .frame(width: 6, height: 6)
-                                    Text("Listening…")
-                                        .font(.system(size: 13))
-                                        .italic()
-                                        .foregroundStyle(.tertiary)
-                                }
-                            } else {
-                                Text("Idle")
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(.tertiary)
-                            }
-                        } else {
-                            Text(text)
-                                .font(.system(size: 16))
-                                .lineSpacing(4)
-                                .italic()
-                                .foregroundStyle(.primary.opacity(0.9))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id("end")
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(14)
-            }
-            .onChange(of: text) { _ in
-                if !text.isEmpty {
-                    proxy.scrollTo("end", anchor: .bottom)
-                }
-            }
-        }
-    }
-
     // MARK: - Empty state
 
     private var emptyState: some View {
@@ -297,61 +485,6 @@ struct ContentView: View {
                 .frame(maxWidth: 380)
         }
         .padding(.horizontal, 30)
-    }
-
-    // MARK: - Status bar
-
-    private var statusBar: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 10) {
-                StatusBadge(text: vm.statusText, isRunning: vm.isRunning, isError: vm.statusIsError)
-                Spacer()
-                APIKeyChip(source: vm.apiKeySource, action: openSettingsWindow)
-                PermissionChip(label: "Mic", state: vm.micPermission, relevant: vm.selectedSource.usesMic)
-                PermissionChip(label: "Screen", state: vm.screenPermission, relevant: vm.selectedSource.usesScreen)
-                Divider().frame(height: 14)
-                DataChip(icon: "arrow.up.circle.fill",
-                         text: formatBytes(vm.audioBytesSent),
-                         tint: (vm.isRunning && vm.audioBytesSent == 0) ? .red : .secondary)
-                Text(lastFrameText).font(.caption2.monospaced()).foregroundStyle(.secondary)
-                Divider().frame(height: 14)
-                Text("EN \(vm.englishDeltasReceived) · \(vm.selectedOtherLanguage.uppercased()) \(vm.otherDeltasReceived)")
-                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
-                Divider().frame(height: 14)
-                TranscriptionChip(status: vm.transcriptionStatus,
-                                  chars: vm.transcriptionCharsReceived)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 8)
-            .background(.regularMaterial)
-        }
-    }
-
-    // MARK: - Helpers
-
-    private var lastFrameText: String {
-        guard let last = vm.lastAudioAt else { return "no audio" }
-        let dt = Date().timeIntervalSince(last)
-        if dt < 1.0 { return "live" }
-        return String(format: "%.1fs", dt)
-    }
-
-    private func formatBytes(_ n: Int64) -> String {
-        let kb = Double(n) / 1024
-        if kb < 1 { return "\(n) B" }
-        let mb = kb / 1024
-        if mb < 1 { return String(format: "%.1f KB", kb) }
-        return String(format: "%.2f MB", mb)
-    }
-
-    private func copyAllEnglish() {
-        let text = vm.pairs.map(\.english).joined(separator: "\n\n")
-        copyToClipboard(text)
-    }
-
-    private func copyAllOther() {
-        let text = vm.pairs.map(\.other).joined(separator: "\n\n")
-        copyToClipboard(text)
     }
 
     private func copyToClipboard(_ text: String) {
@@ -449,7 +582,7 @@ private struct APIKeyChip: View {
     }
 }
 
-// MARK: - StatusBadge / PulsingRing / PermissionChip / DataChip
+// MARK: - StatusBadge / PermissionChip / DataChip
 
 private struct StatusBadge: View {
     let text: String
@@ -458,9 +591,14 @@ private struct StatusBadge: View {
 
     var body: some View {
         HStack(spacing: 6) {
+            // Static indicator: a filled dot, with a thin static ring while running. No
+            // continuous animation — a repeatForever pulse drove the render loop every
+            // display frame even in silence, which was a major source of idle CPU.
             ZStack {
+                if isRunning && !isError {
+                    Circle().stroke(color.opacity(0.4), lineWidth: 2).frame(width: 13, height: 13)
+                }
                 Circle().fill(color).frame(width: 8, height: 8)
-                if isRunning && !isError { PulsingRing(color: color) }
             }
             .frame(width: 14, height: 14)
             Text(text).font(.caption).foregroundStyle(isError ? Color.red : Color.secondary)
@@ -471,18 +609,6 @@ private struct StatusBadge: View {
         if isError { return .red }
         if isRunning { return .green }
         return .gray
-    }
-}
-
-private struct PulsingRing: View {
-    let color: Color
-    @State private var animate = false
-    var body: some View {
-        Circle()
-            .stroke(color.opacity(animate ? 0 : 0.55), lineWidth: 2)
-            .frame(width: animate ? 14 : 8, height: animate ? 14 : 8)
-            .animation(.easeOut(duration: 1.2).repeatForever(autoreverses: false), value: animate)
-            .onAppear { animate = true }
     }
 }
 

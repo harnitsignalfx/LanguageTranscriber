@@ -36,9 +36,70 @@ enum AudioSource: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - High-churn stores (split off the view model)
+//
+// The fix for sustained high CPU during live transcription: split the monolith into
+// separate ObservableObjects. With a Combine ObservableObject, ANY @Published mutation
+// fires objectWillChange and invalidates EVERY view that injects that object — regardless
+// of which property the view's body reads (per-property observation only exists with the
+// macOS-14 @Observable macro, which this app cannot use). So high-churn state living on the
+// same object that ContentView observes forced ContentView.body (and its toolbar Pickers)
+// to re-render on every translation delta / 4 Hz tick / pair flush.
+//
+// We move the HIGH-CHURN published state into dedicated @MainActor ObservableObjects, each
+// observed ONLY by its leaf view. TranscriberViewModel OWNS them as plain `let` properties
+// (NOT @Published) — reading a plain `let` does NOT subscribe the reader to that store's
+// objectWillChange. TranscriberViewModel keeps ONLY low-churn control state @Published.
+//
+// INVARIANT: after this split, ContentView's objectWillChange subscription (to the VM) fires
+// ONLY on low-churn control changes. A translation delta fires objectWillChange on `liveText`
+// only → re-renders ONLY LivePaneView. A 4 Hz diagnostics tick fires on `diagnostics` only →
+// re-renders ONLY StatusBarView. A pair flush fires on `transcript` only → re-renders ONLY
+// HistoryContainerView (then `.equatable()` gates the list). ContentView.body and the toolbar
+// Pickers do NOT re-render during a steady-state session.
+
+/// High-churn live caption text. Observed ONLY by `LivePaneView`. Updated IMMEDIATELY per
+/// translation delta (no throttling) so the live transcript has zero added latency.
+@MainActor
+final class LiveTextStore: ObservableObject {
+    @Published var english = ""
+    @Published var other = ""
+}
+
+/// Diagnostic mirrors updated at ~4 Hz by the VM's diagnostics timer. Observed ONLY by
+/// `StatusBarView`.
+@MainActor
+final class DiagnosticsStore: ObservableObject {
+    @Published var audioBytesSent: Int64 = 0
+    @Published var lastAudioAt: Date?
+    @Published var englishDeltasReceived: Int = 0
+    @Published var otherDeltasReceived: Int = 0
+    @Published var eventCounts: [String: Int] = [:]
+    @Published var transcriptionStatus: String = "off"
+    @Published var transcriptionEventCounts: [String: Int] = [:]
+    @Published var transcriptionCharsReceived: Int = 0
+}
+
+/// Finalized utterance pairs. Observed ONLY by `HistoryContainerView`.
+@MainActor
+final class TranscriptStore: ObservableObject {
+    /// Single ordered list of finalized utterance pairs. Each pair carries both translations
+    /// of the same audio segment so the EN and OTHER columns are always row-aligned.
+    @Published var pairs: [UtterancePair] = []
+}
+
 @MainActor
 final class TranscriberViewModel: ObservableObject {
-    // MARK: - Published state
+    // MARK: - High-churn stores (owned as plain `let`s — NOT @Published)
+    //
+    // Reading these from ContentView does NOT subscribe ContentView to their changes; the
+    // leaf views take them as @ObservedObject so each store's mutations re-render only that
+    // leaf view.
+    let liveText = LiveTextStore()
+    let diagnostics = DiagnosticsStore()
+    let transcript = TranscriptStore()
+
+    // MARK: - Published state (LOW-CHURN control state ONLY)
 
     @Published var statusText: String = "Idle"
     @Published var statusIsError: Bool = false
@@ -48,28 +109,91 @@ final class TranscriberViewModel: ObservableObject {
     @Published var configIssue: String?
     @Published var apiKeySource: AppConfig.APIKeySource = .none
 
-    /// Single ordered list of finalized utterance pairs. Each pair carries both translations
-    /// of the same audio segment so the EN and OTHER columns are always row-aligned.
-    @Published var pairs: [UtterancePair] = []
-    @Published var liveEnglish: String = ""
-    @Published var liveOther: String = ""
+    /// Low-churn mirror of "are there any committed pairs". ContentView.body's toolbar +
+    /// column headers read THIS (for Clear/Copy disabled states) instead of `pairs` directly,
+    /// so ContentView.body is NOT invalidated on every pair flush — it flips only on the
+    /// empty <-> non-empty transition (stable during a session). Without this, every flush
+    /// re-ran ContentView.body and rebuilt the toolbar's Pickers (expensive 20-item menu).
+    /// (We deliberately do NOT mirror live text: it toggles every utterance, which would
+    /// re-introduce the churn — the Clear button keys off hasPairs alone.)
+    ///
+    /// `pairs` now lives on `transcript` (a separate store), so `transcript.pairs.didSet`
+    /// cannot reach this property. The VM instead calls `refreshHasPairs()` right after every
+    /// `transcript.pairs` mutation (append in flush, reset in clearTranscript). `hasPairs`
+    /// stays on the VM (low-churn, drives the toolbar) — that's intentional.
+    @Published var hasPairs: Bool = false
+
+    private func refreshHasPairs() {
+        let has = !transcript.pairs.isEmpty
+        if has != hasPairs { hasPairs = has }
+    }
 
     @Published var selectedOtherLanguage: String = "pt"
     let availableLanguages: [Language] = Languages.common
 
+    // MARK: - User-editable settings (persisted to UserDefaults)
+    //
+    // Effective-value precedence is resolved once in `loadConfig()`: UserDefaults override
+    // (if the user has set one) → config.json (AppConfig) → hardcoded default. After that,
+    // every change here writes straight back to UserDefaults via `didSet`.
+    //
+    // The two timing values are read LIVE in `scheduleFlush()`, so edits apply without
+    // restarting a session. `detectSourceLanguage` and `transcriptionModel` are read at
+    // `start()`, so they apply on the next Start.
+
+    /// While true, didSet observers skip writing to UserDefaults. Set during the initial
+    /// `applyEffectiveSettings()` so resolving the effective value (which may come from
+    /// config.json) doesn't accidentally persist it as a user override.
+    private var isApplyingEffectiveSettings = false
+
+    @Published var segmentSilenceMs: Int = 1500 {
+        didSet { if !isApplyingEffectiveSettings { SettingsStore.segmentSilenceMs = segmentSilenceMs } }
+    }
+    @Published var sentenceFlushMs: Int = 700 {
+        didSet { if !isApplyingEffectiveSettings { SettingsStore.sentenceFlushMs = sentenceFlushMs } }
+    }
+    @Published var detectSourceLanguage: Bool = true {
+        didSet { if !isApplyingEffectiveSettings { SettingsStore.detectSourceLanguage = detectSourceLanguage } }
+    }
+    @Published var transcriptionModel: String = "gpt-realtime-whisper" {
+        didSet { if !isApplyingEffectiveSettings { SettingsStore.transcriptionModel = transcriptionModel } }
+    }
+
+    /// Available transcription models for the Settings picker (label, value).
+    static let transcriptionModelOptions: [(label: String, value: String)] = [
+        ("gpt-realtime-whisper", "gpt-realtime-whisper"),
+        ("gpt-4o-transcribe", "gpt-4o-transcribe"),
+        ("gpt-4o-mini-transcribe", "gpt-4o-mini-transcribe"),
+        ("whisper-1", "whisper-1")
+    ]
+
     // Diagnostics
     @Published var micPermission: PermissionState = .undetermined
     @Published var screenPermission: PermissionState = .undetermined
-    @Published var audioBytesSent: Int64 = 0
-    @Published var lastAudioAt: Date?
-    @Published var englishDeltasReceived: Int = 0
-    @Published var otherDeltasReceived: Int = 0
-    @Published var eventCounts: [String: Int] = [:]
-    /// Transcription session diagnostics — separate from the translation `eventCounts`
-    /// so the user can see whether the third (source-language) session is alive.
-    @Published var transcriptionStatus: String = "off"
-    @Published var transcriptionEventCounts: [String: Int] = [:]
-    @Published var transcriptionCharsReceived: Int = 0
+
+    // High-frequency diagnostic counters. The UI reads ONLY the @Published mirrors below,
+    // which a single ~4 Hz timer copies from these plain-storage accumulators. The raw
+    // counters are mutated synchronously on the main actor at full audio/delta rate, but
+    // they are NOT @Published, so updating them does not invalidate the SwiftUI view tree.
+    // This keeps the status bar from forcing ContentView.body (and the history list) to
+    // re-diff on every audio frame (~50/s) and every translation delta.
+    //
+    // Live transcript text (`liveEnglish` / `liveOther`) is deliberately NOT coalesced —
+    // it stays @Published and updates immediately per delta so there is zero added latency.
+    private var rawAudioBytesSent: Int64 = 0
+    private var rawLastAudioAt: Date?
+    private var rawEnglishDeltasReceived: Int = 0
+    private var rawOtherDeltasReceived: Int = 0
+    private var rawEventCounts: [String: Int] = [:]
+    private var rawTranscriptionEventCounts: [String: Int] = [:]
+    private var rawTranscriptionCharsReceived: Int = 0
+
+    // The @Published diagnostic mirrors the status bar binds to now live on `diagnostics`
+    // (DiagnosticsStore), updated at ~4 Hz by `publishDiagnostics()`. Mutating them fires
+    // objectWillChange on `diagnostics` only → re-renders ONLY StatusBarView.
+
+    /// Copies the raw diagnostic accumulators into their @Published mirrors at ~4 Hz.
+    private var diagnosticsTimer: Timer?
 
     // MARK: - Internal
 
@@ -104,8 +228,13 @@ final class TranscriberViewModel: ObservableObject {
     }
 
     func refreshPermissions() {
-        micPermission = Permissions.microphone()
-        screenPermission = Permissions.screenRecording()
+        // Only assign when changed — @Published fires objectWillChange on every assignment
+        // even if the value is identical, which would re-run ContentView.body every 2s for
+        // no reason.
+        let mic = Permissions.microphone()
+        if mic != micPermission { micPermission = mic }
+        let screen = Permissions.screenRecording()
+        if screen != screenPermission { screenPermission = screen }
     }
 
     // MARK: - Config
@@ -119,10 +248,12 @@ final class TranscriberViewModel: ObservableObject {
             apiKeySource = source
             let initialCode = (cfg.otherLanguage?.isEmpty == false) ? cfg.otherLanguage! : "pt"
             selectedOtherLanguage = initialCode
+            applyEffectiveSettings(config: cfg)
 
         case .notFound(let searched, let parseErrors):
             configLoaded = false
             apiKeySource = .none
+            applyEffectiveSettings(config: nil)
             var msg = "No OpenAI API key found.\n\n"
             msg += "Easiest fix: open Settings (⌘ ,) and paste your API key.\n"
             msg += "Alternatives: set OPENAI_API_KEY env var, or create config.json with {\"apiKey\": \"sk-…\"} at one of:\n"
@@ -137,6 +268,20 @@ final class TranscriberViewModel: ObservableObject {
         }
     }
 
+    /// Resolve the effective value of each editable setting with precedence:
+    /// UserDefaults override (if set) → config.json (AppConfig) → hardcoded default.
+    /// Runs with `isApplyingEffectiveSettings` set so this resolution is not itself
+    /// written back to UserDefaults.
+    private func applyEffectiveSettings(config: AppConfig?) {
+        isApplyingEffectiveSettings = true
+        defer { isApplyingEffectiveSettings = false }
+
+        segmentSilenceMs   = SettingsStore.segmentSilenceMs   ?? config?.resolvedSegmentSilenceMs   ?? 1500
+        sentenceFlushMs    = SettingsStore.sentenceFlushMs    ?? config?.resolvedSentenceFlushMs    ?? 700
+        detectSourceLanguage = SettingsStore.detectSourceLanguage ?? config?.resolvedDetectSourceLanguage ?? true
+        transcriptionModel = SettingsStore.transcriptionModel ?? config?.resolvedTranscriptionModel ?? "gpt-realtime-whisper"
+    }
+
     // MARK: - Lifecycle
 
     func start() {
@@ -148,11 +293,19 @@ final class TranscriberViewModel: ObservableObject {
 
         refreshPermissions()
         clearTranscript()
-        audioBytesSent = 0
-        lastAudioAt = nil
-        englishDeltasReceived = 0
-        otherDeltasReceived = 0
-        eventCounts = [:]
+        // Reset both the raw accumulators and their published mirrors so a fresh session
+        // starts from zero in the status bar.
+        rawAudioBytesSent = 0
+        rawLastAudioAt = nil
+        rawEnglishDeltasReceived = 0
+        rawOtherDeltasReceived = 0
+        rawEventCounts = [:]
+        diagnostics.audioBytesSent = 0
+        diagnostics.lastAudioAt = nil
+        diagnostics.englishDeltasReceived = 0
+        diagnostics.otherDeltasReceived = 0
+        diagnostics.eventCounts = [:]
+        startDiagnosticsTimer()
 
         let lang = selectedOtherLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
         let otherLang = lang.isEmpty ? "pt" : lang
@@ -166,20 +319,22 @@ final class TranscriberViewModel: ObservableObject {
         // Spin up the source-language transcription session if enabled. Its sole job is
         // to tell us which language the speaker actually used so the UI can tint the
         // matching cell.
-        if config.resolvedDetectSourceLanguage {
-            transcriptionStatus = "connecting"
-            transcriptionEventCounts = [:]
-            transcriptionCharsReceived = 0
+        if detectSourceLanguage {
+            diagnostics.transcriptionStatus = "connecting"
+            rawTranscriptionEventCounts = [:]
+            rawTranscriptionCharsReceived = 0
+            diagnostics.transcriptionEventCounts = [:]
+            diagnostics.transcriptionCharsReceived = 0
 
             let tc = TranscriptionClient(apiKey: config.apiKey,
-                                         model: config.resolvedTranscriptionModel)
+                                         model: transcriptionModel)
             tc.onState = { [weak self] state in
                 Task { @MainActor [weak self] in
                     switch state {
-                    case .connecting:   self?.transcriptionStatus = "connecting"
-                    case .connected:    self?.transcriptionStatus = "connected"
-                    case .disconnected: self?.transcriptionStatus = "off"
-                    case .failed(let m): self?.transcriptionStatus = "failed: \(m)"
+                    case .connecting:   self?.diagnostics.transcriptionStatus = "connecting"
+                    case .connected:    self?.diagnostics.transcriptionStatus = "connected"
+                    case .disconnected: self?.diagnostics.transcriptionStatus = "off"
+                    case .failed(let m): self?.diagnostics.transcriptionStatus = "failed: \(m)"
                     }
                 }
             }
@@ -187,7 +342,7 @@ final class TranscriberViewModel: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.liveTranscription += delta
-                    self.transcriptionCharsReceived &+= delta.count
+                    self.rawTranscriptionCharsReceived &+= delta.count
                 }
             }
             tc.onFinalTranscript = { [weak self] text in
@@ -197,7 +352,7 @@ final class TranscriberViewModel: ObservableObject {
                     guard let self else { return }
                     if self.liveTranscription.isEmpty {
                         self.liveTranscription = text
-                        self.transcriptionCharsReceived &+= text.count
+                        self.rawTranscriptionCharsReceived &+= text.count
                     }
                 }
             }
@@ -211,13 +366,13 @@ final class TranscriberViewModel: ObservableObject {
             }
             tc.onAnyEvent = { [weak self] type in
                 Task { @MainActor [weak self] in
-                    self?.transcriptionEventCounts[type, default: 0] += 1
+                    self?.rawTranscriptionEventCounts[type, default: 0] += 1
                 }
             }
             tc.connect()
             transcriptionClient = tc
         } else {
-            transcriptionStatus = "off"
+            diagnostics.transcriptionStatus = "off"
         }
 
         isRunning = true
@@ -264,14 +419,20 @@ final class TranscriberViewModel: ObservableObject {
 
         flushLive()
 
+        // Final flush of the diagnostic accumulators so the status bar reflects the true
+        // totals after the last audio frame, then stop the coalescing timer.
+        publishDiagnostics()
+        stopDiagnosticsTimer()
+
         isRunning = false
         setStatus("Stopped", isError: false)
     }
 
     func clearTranscript() {
-        pairs = []
-        liveEnglish = ""
-        liveOther = ""
+        transcript.pairs = []
+        refreshHasPairs()
+        liveText.english = ""
+        liveText.other = ""
         liveTranscription = ""
         flushWork?.cancel(); flushWork = nil
         lastFlushAt = nil
@@ -295,7 +456,7 @@ final class TranscriberViewModel: ObservableObject {
         }
         if isEnglish {
             c.onAnyEvent = { [weak self] type in
-                Task { @MainActor [weak self] in self?.eventCounts[type, default: 0] += 1 }
+                Task { @MainActor [weak self] in self?.rawEventCounts[type, default: 0] += 1 }
             }
         }
         return c
@@ -356,29 +517,47 @@ final class TranscriberViewModel: ObservableObject {
         englishClient?.sendAudio(data)
         otherClient?.sendAudio(data)
         transcriptionClient?.sendAudio(data)
+        // Accumulate into plain (non-@Published) storage; the ~4 Hz diagnostics timer
+        // publishes it. This used to write @Published props on every audio chunk (~50/s).
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.audioBytesSent &+= Int64(data.count)
-            self.lastAudioAt = Date()
+            self.rawAudioBytesSent &+= Int64(data.count)
+            self.rawLastAudioAt = Date()
         }
     }
 
     // MARK: - Delta handling
 
     private func handleTargetDelta(_ delta: String, isEnglish: Bool) {
+        // liveEnglish / liveOther are @Published and update IMMEDIATELY — no coalescing,
+        // so the live transcript has zero added latency. Only the delta COUNTERS (status
+        // bar diagnostics) are accumulated into plain storage and published at ~4 Hz.
         if isEnglish {
-            englishDeltasReceived += 1
-            liveEnglish += delta
+            rawEnglishDeltasReceived += 1
+            liveText.english += delta
         } else {
-            otherDeltasReceived += 1
-            liveOther += delta
+            rawOtherDeltasReceived += 1
+            liveText.other += delta
         }
         scheduleFlush()
     }
 
     private func scheduleFlush() {
         flushWork?.cancel()
-        let ms = config?.resolvedSegmentSilenceMs ?? 1500
+        // Sentence-aware debounce: once the buffers end on sentence-terminating punctuation,
+        // use a much shorter quiet window so we break paragraphs at sentence boundaries
+        // instead of letting them run on.
+        //
+        // We only shorten the window when EVERY non-empty column looks sentence-complete,
+        // and at least one column has content. If English finished a sentence but the other
+        // column is still mid-translation (non-empty, no terminator yet), we keep the full
+        // window so we don't commit a truncated counterpart.
+        let enReady = liveText.english.isEmpty || endsSentence(liveText.english)
+        let otherReady = liveText.other.isEmpty || endsSentence(liveText.other)
+        let hasContent = !liveText.english.isEmpty || !liveText.other.isEmpty
+        let atSentenceEnd = hasContent && enReady && otherReady
+        // Read the live, UserDefaults-aware settings so timing edits apply without restarting.
+        let ms = atSentenceEnd ? sentenceFlushMs : segmentSilenceMs
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in self?.flushLive() }
         }
@@ -386,9 +565,18 @@ final class TranscriberViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms), execute: work)
     }
 
+    /// True when the trimmed text ends on a sentence terminator. Covers Latin (. ! ? …),
+    /// CJK (。！？), and Devanagari (।) so it works across the supported languages.
+    private func endsSentence(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last else {
+            return false
+        }
+        return ".!?…。！？।".contains(last)
+    }
+
     private func flushLive() {
-        let en = liveEnglish.trimmingCharacters(in: .whitespacesAndNewlines)
-        let other = liveOther.trimmingCharacters(in: .whitespacesAndNewlines)
+        let en = liveText.english.trimmingCharacters(in: .whitespacesAndNewlines)
+        let other = liveText.other.trimmingCharacters(in: .whitespacesAndNewlines)
         let source = liveTranscription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !en.isEmpty || !other.isEmpty else {
             liveTranscription = ""
@@ -399,21 +587,22 @@ final class TranscriberViewModel: ObservableObject {
         // common case of speaker bleed (Both mode without headphones) producing two
         // transcripts of the same utterance.
         if isDuplicateOfRecent(en: en, other: other) {
-            liveEnglish = ""
-            liveOther = ""
+            liveText.english = ""
+            liveText.other = ""
             liveTranscription = ""
             return
         }
 
-        pairs.append(UtterancePair(
+        transcript.pairs.append(UtterancePair(
             id: UUID().uuidString,
             english: en,
             other: other,
             originalLanguage: classifySourceLanguage(source)
         ))
+        refreshHasPairs()
         lastFlushAt = Date()
-        liveEnglish = ""
-        liveOther = ""
+        liveText.english = ""
+        liveText.other = ""
         liveTranscription = ""
     }
 
@@ -433,9 +622,16 @@ final class TranscriberViewModel: ObservableObject {
 
     private func isDuplicateOfRecent(en: String, other: String) -> Bool {
         guard let lastFlushAt, Date().timeIntervalSince(lastFlushAt) < 6.0 else { return false }
-        for p in pairs.suffix(3) {
-            if !en.isEmpty && jaccardSimilarity(en, p.english) >= 0.82 { return true }
-            if !other.isEmpty && jaccardSimilarity(other, p.other) >= 0.82 { return true }
+        // Only dedup substantial utterances. Short ones ("Yes.", "Okay", "Right") are
+        // legitimately repeated in real conversation, and with sentence-aware flushing
+        // producing shorter paragraphs, deduping them would silently eat real speech.
+        // Echo bleed (the case this guards against) is almost always full sentences.
+        let enWords = normalizeForCompare(en).count
+        let otherWords = normalizeForCompare(other).count
+        guard enWords >= 4 || otherWords >= 4 else { return false }
+        for p in transcript.pairs.suffix(3) {
+            if enWords >= 4 && jaccardSimilarity(en, p.english) >= 0.82 { return true }
+            if otherWords >= 4 && jaccardSimilarity(other, p.other) >= 0.82 { return true }
         }
         return false
     }
@@ -456,6 +652,36 @@ final class TranscriberViewModel: ObservableObject {
         }
         let cleaned = String(String.UnicodeScalarView(scalars))
         return Set(cleaned.split(separator: " ", omittingEmptySubsequences: true).map(String.init))
+    }
+
+    // MARK: - Diagnostics coalescing
+
+    /// Start the ~4 Hz timer that flushes raw diagnostic counters into their @Published
+    /// mirrors. Idempotent: tears down any existing timer first.
+    private func startDiagnosticsTimer() {
+        diagnosticsTimer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.publishDiagnostics() }
+        }
+        diagnosticsTimer = t
+    }
+
+    private func stopDiagnosticsTimer() {
+        diagnosticsTimer?.invalidate()
+        diagnosticsTimer = nil
+    }
+
+    /// Copy raw accumulators into the @Published mirrors, but only assign properties whose
+    /// value actually changed — an unchanged @Published assignment still fires objectWillChange,
+    /// so guarding keeps the UI from invalidating when nothing moved.
+    private func publishDiagnostics() {
+        if diagnostics.audioBytesSent != rawAudioBytesSent { diagnostics.audioBytesSent = rawAudioBytesSent }
+        if diagnostics.lastAudioAt != rawLastAudioAt { diagnostics.lastAudioAt = rawLastAudioAt }
+        if diagnostics.englishDeltasReceived != rawEnglishDeltasReceived { diagnostics.englishDeltasReceived = rawEnglishDeltasReceived }
+        if diagnostics.otherDeltasReceived != rawOtherDeltasReceived { diagnostics.otherDeltasReceived = rawOtherDeltasReceived }
+        if diagnostics.eventCounts != rawEventCounts { diagnostics.eventCounts = rawEventCounts }
+        if diagnostics.transcriptionEventCounts != rawTranscriptionEventCounts { diagnostics.transcriptionEventCounts = rawTranscriptionEventCounts }
+        if diagnostics.transcriptionCharsReceived != rawTranscriptionCharsReceived { diagnostics.transcriptionCharsReceived = rawTranscriptionCharsReceived }
     }
 
     // MARK: - Status

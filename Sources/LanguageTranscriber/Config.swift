@@ -5,19 +5,22 @@ struct AppConfig: Codable {
     var model: String?                  // realtime translation model. Default: "gpt-realtime-translate"
     var otherLanguage: String?          // ISO 639-1 code for the non-English pane. If nil, auto-detect.
     var segmentSilenceMs: Int?          // ms of no deltas before pushing a segment to history. Default: 1500.
-    var transcriptionModel: String?     // model for the source-language transcription session. Default: "gpt-4o-mini-transcribe"
+    var sentenceFlushMs: Int?           // shorter quiet window applied once the buffer ends a sentence. Default: 700.
+    var transcriptionModel: String?     // model for the source-language transcription session. Default: "gpt-realtime-whisper"
     var detectSourceLanguage: Bool?     // run a 3rd transcription session to label which side was originally spoken. Default: true
 
     init(apiKey: String,
          model: String? = nil,
          otherLanguage: String? = nil,
          segmentSilenceMs: Int? = nil,
+         sentenceFlushMs: Int? = nil,
          transcriptionModel: String? = nil,
          detectSourceLanguage: Bool? = nil) {
         self.apiKey = apiKey
         self.model = model
         self.otherLanguage = otherLanguage
         self.segmentSilenceMs = segmentSilenceMs
+        self.sentenceFlushMs = sentenceFlushMs
         self.transcriptionModel = transcriptionModel
         self.detectSourceLanguage = detectSourceLanguage
     }
@@ -76,6 +79,7 @@ struct AppConfig: Codable {
                         model: partial.model,
                         otherLanguage: partial.otherLanguage,
                         segmentSilenceMs: partial.segmentSilenceMs,
+                        sentenceFlushMs: partial.sentenceFlushMs,
                         transcriptionModel: partial.transcriptionModel,
                         detectSourceLanguage: partial.detectSourceLanguage
                     )
@@ -92,6 +96,7 @@ struct AppConfig: Codable {
                 model: json.model,
                 otherLanguage: json.otherLanguage,
                 segmentSilenceMs: json.segmentSilenceMs,
+                sentenceFlushMs: json.sentenceFlushMs,
                 transcriptionModel: json.transcriptionModel,
                 detectSourceLanguage: json.detectSourceLanguage
             ), source: .keychain)
@@ -128,6 +133,7 @@ struct AppConfig: Codable {
         var model: String?
         var otherLanguage: String?
         var segmentSilenceMs: Int?
+        var sentenceFlushMs: Int?
         var transcriptionModel: String?
         var detectSourceLanguage: Bool?
     }
@@ -170,6 +176,41 @@ struct AppConfig: Codable {
 
     var resolvedModel: String { model ?? "gpt-realtime-translate" }
     var resolvedSegmentSilenceMs: Int { segmentSilenceMs ?? 1500 }
+    var resolvedSentenceFlushMs: Int { sentenceFlushMs ?? 700 }
     var resolvedTranscriptionModel: String { transcriptionModel ?? "gpt-realtime-whisper" }
     var resolvedDetectSourceLanguage: Bool { detectSourceLanguage ?? true }
+}
+
+/// Thin UserDefaults-backed store for the in-app editable settings. Each getter returns
+/// `nil` when the user has never set that key, which lets callers fall back to config.json
+/// and then to a hardcoded default. The API key deliberately lives in the Keychain, not here.
+enum SettingsStore {
+    private static let defaults = UserDefaults.standard
+
+    private enum Key {
+        static let segmentSilenceMs   = "settings.segmentSilenceMs"
+        static let sentenceFlushMs    = "settings.sentenceFlushMs"
+        static let detectSourceLanguage = "settings.detectSourceLanguage"
+        static let transcriptionModel = "settings.transcriptionModel"
+    }
+
+    static var segmentSilenceMs: Int? {
+        get { defaults.object(forKey: Key.segmentSilenceMs) as? Int }
+        set { newValue.map { defaults.set($0, forKey: Key.segmentSilenceMs) } }
+    }
+
+    static var sentenceFlushMs: Int? {
+        get { defaults.object(forKey: Key.sentenceFlushMs) as? Int }
+        set { newValue.map { defaults.set($0, forKey: Key.sentenceFlushMs) } }
+    }
+
+    static var detectSourceLanguage: Bool? {
+        get { defaults.object(forKey: Key.detectSourceLanguage) as? Bool }
+        set { newValue.map { defaults.set($0, forKey: Key.detectSourceLanguage) } }
+    }
+
+    static var transcriptionModel: String? {
+        get { defaults.string(forKey: Key.transcriptionModel) }
+        set { newValue.map { defaults.set($0, forKey: Key.transcriptionModel) } }
+    }
 }
