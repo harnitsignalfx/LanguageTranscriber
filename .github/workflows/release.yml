@@ -28,10 +28,10 @@ jobs:
           xcodebuild -version
 
       - name: Build .app
-        run: ./build.sh release
+        run: bash ./build.sh release
 
       - name: Package zip + dmg
-        run: ./package.sh --dmg
+        run: bash ./package.sh --dmg
 
       - name: Sanity-check artifacts
         run: |
