@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import NaturalLanguage
 
 enum AudioSource: String, CaseIterable, Identifiable {
     case microphone = "Microphone"
@@ -64,6 +65,11 @@ final class TranscriberViewModel: ObservableObject {
     @Published var englishDeltasReceived: Int = 0
     @Published var otherDeltasReceived: Int = 0
     @Published var eventCounts: [String: Int] = [:]
+    /// Transcription session diagnostics — separate from the translation `eventCounts`
+    /// so the user can see whether the third (source-language) session is alive.
+    @Published var transcriptionStatus: String = "off"
+    @Published var transcriptionEventCounts: [String: Int] = [:]
+    @Published var transcriptionCharsReceived: Int = 0
 
     // MARK: - Internal
 
@@ -73,6 +79,12 @@ final class TranscriberViewModel: ObservableObject {
     // Both receive the same audio stream (a mixer-merged stream in Both mode).
     private var englishClient: RealtimeClient?
     private var otherClient: RealtimeClient?
+
+    // Optional third session — transcription-only with auto language detection. Its output is
+    // never shown directly; we only use it to figure out which side of the pair the speaker
+    // actually used, then tag the pair so the UI can highlight that cell.
+    private var transcriptionClient: TranscriptionClient?
+    private var liveTranscription: String = ""
 
     private var mic: MicrophoneCapture?
     private var sysAudio: Any?
@@ -151,6 +163,63 @@ final class TranscriberViewModel: ObservableObject {
         englishClient?.connect()
         otherClient?.connect()
 
+        // Spin up the source-language transcription session if enabled. Its sole job is
+        // to tell us which language the speaker actually used so the UI can tint the
+        // matching cell.
+        if config.resolvedDetectSourceLanguage {
+            transcriptionStatus = "connecting"
+            transcriptionEventCounts = [:]
+            transcriptionCharsReceived = 0
+
+            let tc = TranscriptionClient(apiKey: config.apiKey,
+                                         model: config.resolvedTranscriptionModel)
+            tc.onState = { [weak self] state in
+                Task { @MainActor [weak self] in
+                    switch state {
+                    case .connecting:   self?.transcriptionStatus = "connecting"
+                    case .connected:    self?.transcriptionStatus = "connected"
+                    case .disconnected: self?.transcriptionStatus = "off"
+                    case .failed(let m): self?.transcriptionStatus = "failed: \(m)"
+                    }
+                }
+            }
+            tc.onPartialTranscript = { [weak self] delta in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.liveTranscription += delta
+                    self.transcriptionCharsReceived &+= delta.count
+                }
+            }
+            tc.onFinalTranscript = { [weak self] text in
+                Task { @MainActor [weak self] in
+                    // Accumulator gets the final text too (covers the case where deltas
+                    // dropped and the completed event is the first time we see anything).
+                    guard let self else { return }
+                    if self.liveTranscription.isEmpty {
+                        self.liveTranscription = text
+                        self.transcriptionCharsReceived &+= text.count
+                    }
+                }
+            }
+            tc.onError = { [weak self] err in
+                // %{public}@ keeps the message readable in `log show`; the default %@
+                // gets redacted as <private> on macOS.
+                NSLog("[LanguageTranscriber] transcription error: %{public}@", err)
+                Task { @MainActor [weak self] in
+                    self?.setStatus("Transcription: \(err)", isError: true)
+                }
+            }
+            tc.onAnyEvent = { [weak self] type in
+                Task { @MainActor [weak self] in
+                    self?.transcriptionEventCounts[type, default: 0] += 1
+                }
+            }
+            tc.connect()
+            transcriptionClient = tc
+        } else {
+            transcriptionStatus = "off"
+        }
+
         isRunning = true
         setStatus("Connecting…", isError: false)
 
@@ -189,8 +258,9 @@ final class TranscriberViewModel: ObservableObject {
         mixer?.stop()
         mixer = nil
 
-        englishClient?.disconnect(); englishClient = nil
-        otherClient?.disconnect();   otherClient = nil
+        englishClient?.disconnect();      englishClient = nil
+        otherClient?.disconnect();        otherClient = nil
+        transcriptionClient?.disconnect(); transcriptionClient = nil
 
         flushLive()
 
@@ -202,6 +272,7 @@ final class TranscriberViewModel: ObservableObject {
         pairs = []
         liveEnglish = ""
         liveOther = ""
+        liveTranscription = ""
         flushWork?.cancel(); flushWork = nil
         lastFlushAt = nil
     }
@@ -284,6 +355,7 @@ final class TranscriberViewModel: ObservableObject {
     private func fanOutAudio(_ data: Data) {
         englishClient?.sendAudio(data)
         otherClient?.sendAudio(data)
+        transcriptionClient?.sendAudio(data)
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.audioBytesSent &+= Int64(data.count)
@@ -317,7 +389,11 @@ final class TranscriberViewModel: ObservableObject {
     private func flushLive() {
         let en = liveEnglish.trimmingCharacters(in: .whitespacesAndNewlines)
         let other = liveOther.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !en.isEmpty || !other.isEmpty else { return }
+        let source = liveTranscription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !en.isEmpty || !other.isEmpty else {
+            liveTranscription = ""
+            return
+        }
 
         // Light dedup: drop near-identical paragraphs landing within ~6 s. Catches the
         // common case of speaker bleed (Both mode without headphones) producing two
@@ -325,13 +401,34 @@ final class TranscriberViewModel: ObservableObject {
         if isDuplicateOfRecent(en: en, other: other) {
             liveEnglish = ""
             liveOther = ""
+            liveTranscription = ""
             return
         }
 
-        pairs.append(UtterancePair(id: UUID().uuidString, english: en, other: other))
+        pairs.append(UtterancePair(
+            id: UUID().uuidString,
+            english: en,
+            other: other,
+            originalLanguage: classifySourceLanguage(source)
+        ))
         lastFlushAt = Date()
         liveEnglish = ""
         liveOther = ""
+        liveTranscription = ""
+    }
+
+    /// Detect the dominant language of the source-language transcript via Apple's
+    /// `NLLanguageRecognizer`. Map English → `.english`, the picked other language → `.other`,
+    /// anything else (including empty/too-short transcripts) → `.unknown`.
+    private func classifySourceLanguage(_ text: String) -> OriginalLanguage {
+        guard text.count >= 5 else { return .unknown }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        guard let lang = recognizer.dominantLanguage else { return .unknown }
+        let code = lang.rawValue
+        if code == "en" { return .english }
+        if code.caseInsensitiveCompare(selectedOtherLanguage) == .orderedSame { return .other }
+        return .unknown
     }
 
     private func isDuplicateOfRecent(en: String, other: String) -> Bool {

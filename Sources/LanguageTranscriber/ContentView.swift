@@ -183,9 +183,11 @@ struct ContentView: View {
 
     private func pairRow(_ pair: UtterancePair) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            transcriptCell(pair.other, accent: .indigo)
+            transcriptCell(pair.other, accent: .indigo,
+                           isOriginal: pair.originalLanguage == .other)
             Divider()
-            transcriptCell(pair.english, accent: .blue)
+            transcriptCell(pair.english, accent: .blue,
+                           isOriginal: pair.originalLanguage == .english)
         }
         .contextMenu {
             Button("Copy English") { copyToClipboard(pair.english) }
@@ -194,7 +196,7 @@ struct ContentView: View {
         }
     }
 
-    private func transcriptCell(_ text: String, accent: Color) -> some View {
+    private func transcriptCell(_ text: String, accent: Color, isOriginal: Bool = false) -> some View {
         Text(text.isEmpty ? "—" : text)
             .font(.system(size: 16))
             .lineSpacing(4)
@@ -203,6 +205,14 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
+            .background(isOriginal ? originalLanguageHighlight : Color.clear)
+    }
+
+    /// Soft green tint applied to the cell whose language the speaker actually used,
+    /// as determined by Apple's NLLanguageRecognizer on the third (transcription-only)
+    /// realtime session. Adapts naturally to dark mode via the system green.
+    private var originalLanguageHighlight: Color {
+        Color.green.opacity(0.14)
     }
 
     // MARK: - Live pane (the current utterance, separated from history)
@@ -308,6 +318,9 @@ struct ContentView: View {
                 Divider().frame(height: 14)
                 Text("EN \(vm.englishDeltasReceived) · \(vm.selectedOtherLanguage.uppercased()) \(vm.otherDeltasReceived)")
                     .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                Divider().frame(height: 14)
+                TranscriptionChip(status: vm.transcriptionStatus,
+                                  chars: vm.transcriptionCharsReceived)
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
             .background(.regularMaterial)
@@ -525,6 +538,48 @@ private struct DataChip: View {
         HStack(spacing: 3) {
             Image(systemName: icon).foregroundStyle(tint).font(.system(size: 11))
             Text(text).font(.caption2.monospaced()).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Chip for the source-language transcription session (used to drive the green "original
+/// language" highlight). Green when connected and receiving text, orange when connecting,
+/// red on failure, gray when off.
+private struct TranscriptionChip: View {
+    let status: String
+    let chars: Int
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .foregroundStyle(tint)
+                .font(.system(size: 11))
+            Text("LID \(chars)")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 4).fill(tint.opacity(0.10)))
+        .help("Source-language transcription session — \(status). Drives the green highlight on the originally-spoken cell. \(chars) chars received.")
+    }
+
+    private var tint: Color {
+        if status.hasPrefix("failed") { return .red }
+        switch status {
+        case "connected":  return chars > 0 ? .green : .orange
+        case "connecting": return .orange
+        case "off":        return .gray
+        default:           return .secondary
+        }
+    }
+
+    private var symbol: String {
+        if status.hasPrefix("failed") { return "exclamationmark.triangle.fill" }
+        switch status {
+        case "connected":  return chars > 0 ? "checkmark.circle.fill" : "ellipsis.circle.fill"
+        case "connecting": return "ellipsis.circle.fill"
+        case "off":        return "minus.circle"
+        default:           return "questionmark.circle"
         }
     }
 }

@@ -2,9 +2,25 @@ import Foundation
 
 struct AppConfig: Codable {
     let apiKey: String
-    var model: String?              // realtime translation model. Default: "gpt-realtime-translate"
-    var otherLanguage: String?      // ISO 639-1 code for the non-English pane. If nil, auto-detect.
-    var segmentSilenceMs: Int?      // ms of no deltas before pushing a segment to history. Default: 1500.
+    var model: String?                  // realtime translation model. Default: "gpt-realtime-translate"
+    var otherLanguage: String?          // ISO 639-1 code for the non-English pane. If nil, auto-detect.
+    var segmentSilenceMs: Int?          // ms of no deltas before pushing a segment to history. Default: 1500.
+    var transcriptionModel: String?     // model for the source-language transcription session. Default: "gpt-4o-mini-transcribe"
+    var detectSourceLanguage: Bool?     // run a 3rd transcription session to label which side was originally spoken. Default: true
+
+    init(apiKey: String,
+         model: String? = nil,
+         otherLanguage: String? = nil,
+         segmentSilenceMs: Int? = nil,
+         transcriptionModel: String? = nil,
+         detectSourceLanguage: Bool? = nil) {
+        self.apiKey = apiKey
+        self.model = model
+        self.otherLanguage = otherLanguage
+        self.segmentSilenceMs = segmentSilenceMs
+        self.transcriptionModel = transcriptionModel
+        self.detectSourceLanguage = detectSourceLanguage
+    }
 
     /// Where the API key actually came from for this load.
     enum APIKeySource: String {
@@ -59,7 +75,9 @@ struct AppConfig: Codable {
                         apiKey: k,
                         model: partial.model,
                         otherLanguage: partial.otherLanguage,
-                        segmentSilenceMs: partial.segmentSilenceMs
+                        segmentSilenceMs: partial.segmentSilenceMs,
+                        transcriptionModel: partial.transcriptionModel,
+                        detectSourceLanguage: partial.detectSourceLanguage
                     )
                     break
                 }
@@ -73,7 +91,9 @@ struct AppConfig: Codable {
                 apiKey: k,
                 model: json.model,
                 otherLanguage: json.otherLanguage,
-                segmentSilenceMs: json.segmentSilenceMs
+                segmentSilenceMs: json.segmentSilenceMs,
+                transcriptionModel: json.transcriptionModel,
+                detectSourceLanguage: json.detectSourceLanguage
             ), source: .keychain)
         }
 
@@ -108,6 +128,8 @@ struct AppConfig: Codable {
         var model: String?
         var otherLanguage: String?
         var segmentSilenceMs: Int?
+        var transcriptionModel: String?
+        var detectSourceLanguage: Bool?
     }
 
     /// Build the ordered list of locations to check, robust to whether `Bundle.main` resolves to
@@ -148,4 +170,6 @@ struct AppConfig: Codable {
 
     var resolvedModel: String { model ?? "gpt-realtime-translate" }
     var resolvedSegmentSilenceMs: Int { segmentSilenceMs ?? 1500 }
+    var resolvedTranscriptionModel: String { transcriptionModel ?? "gpt-realtime-whisper" }
+    var resolvedDetectSourceLanguage: Bool { detectSourceLanguage ?? true }
 }
